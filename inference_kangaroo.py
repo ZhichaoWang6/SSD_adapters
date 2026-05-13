@@ -129,6 +129,19 @@ def kangaroo_speculative_generate(
     }
     forward_kwargs = {k: v for k, v in forward_kwargs.items() if v is not None}
 
+    # Precompute 3D mRoPE position_ids so the adapter sees the same positions
+    # the base model uses (training feeds 3D mRoPE positions; without this the
+    # adapter falls back to a plain arange and drifts on multimodal inputs).
+    raw_qwen = model.base_model.model  # Qwen2_5_VLForConditionalGeneration
+    prefill_position_ids, _ = raw_qwen.get_rope_index(
+        input_ids=inputs['input_ids'],
+        image_grid_thw=inputs.get('image_grid_thw'),
+        video_grid_thw=inputs.get('video_grid_thw'),
+        second_per_grid_ts=inputs.get('second_per_grid_ts'),
+        attention_mask=inputs.get('attention_mask'),
+    )
+    forward_kwargs['position_ids'] = prefill_position_ids
+
     output = base_model.model(**forward_kwargs)
     base_model.past_key_values = output.past_key_values
 
@@ -138,6 +151,7 @@ def kangaroo_speculative_generate(
     hidden_state_early = output.hidden_states[early_exit_layer]
     _, adapter_past_key_values = adapter_model.forward_early_stop(
         inputs_embeds=hidden_state_early,
+        position_ids=prefill_position_ids,
         use_cache=True,
     )
 
@@ -205,8 +219,24 @@ def kangaroo_speculative_generate(
                 print(f"Draft step {step}, token {tokenizer.decode(predicted_token)}, predict_score {predict_score} < threshold {threshold}, stopping draft")
                 break
 
+            # Build 3D mRoPE position_ids for the adapter, mirroring the formula
+            # used by earlyexit_qwen.forward_draft_or_large_model for incremental
+            # decode: arange over the new tokens + base_model.rope_deltas, then
+            # broadcast to (3, B, L).
+            adapter_seq_len = adapter_input.shape[1]
+            start_pos = adapter_past_key_values[0][0].shape[2] if adapter_past_key_values else 0
+            arange_pos = torch.arange(
+                start_pos, start_pos + adapter_seq_len,
+                device=adapter_input.device, dtype=torch.long,
+            ).view(1, -1).expand(adapter_input.shape[0], -1)
+            rope_deltas = getattr(model.base_model.model, 'rope_deltas', None)
+            if rope_deltas is not None:
+                arange_pos = arange_pos + rope_deltas.to(adapter_input.device)
+            adapter_position_ids = arange_pos.unsqueeze(0).expand(3, -1, -1)
+
             hidden_state, adapter_past_key_values = adapter_model.forward_early_stop(
                 inputs_embeds=adapter_input,
+                position_ids=adapter_position_ids,
                 past_key_values=adapter_past_key_values,
                 use_cache=True,
             )
