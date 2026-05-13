@@ -569,13 +569,6 @@ def summarize_generation_stats(turn_stats):
         'short_reply': _summarize_bucket(short_specs),
         'long_reply': _summarize_bucket(long_specs),
     }
-    window_context_lens = [
-        s.get('window_context_len')
-        for s in spec_stats
-        if s.get('window_context_len') is not None
-    ]
-    if window_context_lens:
-        summary['avg_window_context_len'] = _avg(window_context_lens)
     summary['adapter_accuracy'] = _safe_div(summary['adapter_correct'], summary['adapter_total'])
     summary['adapter_first_accuracy'] = _safe_div(summary['adapter_first_correct'], summary['adapter_first_total'])
     summary['auto_must_reply_progress_per_round'] = (
@@ -596,8 +589,6 @@ def print_generation_summary(title, summary):
         f"{summary['ar_decode_tokens_per_second']:.1f} tok/s | "
         f"speedup {summary['actual_decode_speedup'] or 0:.2f}x"
     )
-    if 'avg_window_context_len' in summary:
-        print(f"Avg window context length: {summary['avg_window_context_len']:.0f}")
     print(
         f"Progress/round {summary['progress_per_round']:.2f} | "
         f"Draft accepted/round {summary['draft_accept_per_round']:.2f} "
