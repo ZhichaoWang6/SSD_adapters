@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig
 
-from adapter import AdapterModel, create_adapter_config
+from adapter import AdapterModel, create_adapter_config, init_adapter_from_base_layer
 from earlyexit_qwen import EarlyExitQwen2_5_VLForConditionalGeneration
 
 
@@ -29,6 +29,7 @@ class KangarooQwenModel(nn.Module):
         adapter_model_path: str = None,
         early_exit_layer: int = 2,
         use_adapter_mlp: bool = None,
+        num_adapter_layers: int = 3,
         dtype=torch.bfloat16,
         attn_implementation: str = 'flash_attention_2',
     ):
@@ -49,16 +50,15 @@ class KangarooQwenModel(nn.Module):
             raw_model, early_exit_layer=early_exit_layer,
         )
 
-        # Create adapter
-        adapter_config = create_adapter_config(base_model_path)
-
         # By default, follow the structure saved with the adapter checkpoint.
         adapter_meta = {}
+        adapter_ckpt = None
         if adapter_model_path is not None:
             adapter_meta_path = os.path.join(adapter_model_path, 'adapter_config.json')
             if os.path.exists(adapter_meta_path):
                 with open(adapter_meta_path, 'r', encoding='utf-8') as f:
                     adapter_meta = json.load(f)
+            adapter_ckpt = os.path.join(adapter_model_path, 'adapter_model.bin')
 
         if "exit_layer" in adapter_meta and adapter_meta["exit_layer"] != early_exit_layer:
             raise ValueError(
@@ -72,39 +72,65 @@ class KangarooQwenModel(nn.Module):
                 f"inference override use_adapter_mlp={use_adapter_mlp}"
             )
 
+        # Resolve num_adapter_layers: checkpoint metadata takes precedence when
+        # an adapter checkpoint is provided. Older checkpoints without this field
+        # are rejected to avoid silently loading mismatched structures.
+        if adapter_ckpt is not None and os.path.exists(adapter_ckpt):
+            if "num_adapter_layers" not in adapter_meta:
+                raise ValueError(
+                    f"Adapter checkpoint at {adapter_model_path} has no 'num_adapter_layers' in "
+                    f"adapter_config.json. Please retrain with the current code to record it."
+                )
+            ckpt_n = adapter_meta["num_adapter_layers"]
+            if ckpt_n != num_adapter_layers:
+                raise ValueError(
+                    f"Adapter checkpoint num_adapter_layers={ckpt_n} does not match "
+                    f"constructor argument num_adapter_layers={num_adapter_layers}"
+                )
+            num_adapter_layers = ckpt_n
+
+        # Create adapter config with resolved layer count
+        adapter_config = create_adapter_config(base_model_path, num_adapter_layers=num_adapter_layers)
+
         if "use_mlp" in adapter_meta:
             adapter_config.use_mlp = adapter_meta["use_mlp"]
         if use_adapter_mlp is not None:
             adapter_config.use_mlp = use_adapter_mlp
 
         self.adapter_model = AdapterModel(adapter_config)
-        print(f"Adapter config: use_mlp={getattr(adapter_config, 'use_mlp', True)}")
+        print(f"Adapter config: use_mlp={getattr(adapter_config, 'use_mlp', True)}, "
+              f"num_adapter_layers={num_adapter_layers}")
         print(self.adapter_model)
 
-        # Load adapter weights if provided
-        if adapter_model_path is not None:
-            adapter_ckpt = os.path.join(adapter_model_path, 'adapter_model.bin')
-            if os.path.exists(adapter_ckpt):
-                state_dict = torch.load(adapter_ckpt, map_location='cpu', weights_only=True)
+        # Load adapter weights if provided; otherwise auto-init from base layers.
+        if adapter_ckpt is not None and os.path.exists(adapter_ckpt):
+            state_dict = torch.load(adapter_ckpt, map_location='cpu', weights_only=True)
 
-                # Strip 'module.' prefix added by Accelerate/DDP wrapping
-                cleaned = {}
-                for k, v in state_dict.items():
-                    new_key = k.replace('module.', '', 1) if k.startswith('module.') else k
-                    cleaned[new_key] = v
+            # Strip 'module.' prefix added by Accelerate/DDP wrapping
+            cleaned = {}
+            for k, v in state_dict.items():
+                new_key = k.replace('module.', '', 1) if k.startswith('module.') else k
+                cleaned[new_key] = v
 
-                missing, unexpected = self.adapter_model.load_state_dict(cleaned, strict=False)
-                if missing:
-                    raise ValueError(
-                        f"Adapter checkpoint is missing {len(missing)} keys for the current structure: {missing[:10]}"
-                    )
-                if unexpected:
-                    raise ValueError(
-                        f"Adapter checkpoint has {len(unexpected)} unexpected keys for the current structure: {unexpected[:10]}"
-                    )
-                print(f"Loaded adapter weights from {adapter_ckpt} (all {len(cleaned)} keys matched)")
-            else:
-                print(f"Warning: adapter checkpoint not found at {adapter_ckpt}, using random weights")
+            missing, unexpected = self.adapter_model.load_state_dict(cleaned, strict=False)
+            if missing:
+                raise ValueError(
+                    f"Adapter checkpoint is missing {len(missing)} keys for the current structure: {missing[:10]}"
+                )
+            if unexpected:
+                raise ValueError(
+                    f"Adapter checkpoint has {len(unexpected)} unexpected keys for the current structure: {unexpected[:10]}"
+                )
+            print(f"Loaded adapter weights from {adapter_ckpt} (all {len(cleaned)} keys matched)")
+        else:
+            if adapter_model_path is not None:
+                print(f"Warning: adapter checkpoint not found at {adapter_ckpt}; "
+                      f"falling back to base-layer initialization.")
+            print(f"Initializing adapter from base model layers "
+                  f"{early_exit_layer}..{early_exit_layer + num_adapter_layers - 1}")
+            init_adapter_from_base_layer(
+                self.adapter_model, base_model_path, source_layer=early_exit_layer,
+            )
 
         self.adapter_model = self.adapter_model.eval().to(raw_model.device).to(dtype)
 

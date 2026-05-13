@@ -6,7 +6,9 @@ to the full model's output distribution.
 Adapted from Kangaroo (https://github.com/Equationliu/Kangaroo) for Qwen2.5 architecture.
 """
 
+import json
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -266,7 +268,7 @@ def _expand_mask(mask, dtype, tgt_len=None):
 class AdapterModel(nn.Module):
     """
     Lightweight adapter that maps early-exit hidden states to full model output space.
-    Architecture: N decoder layers (typically 1) + final RMSNorm.
+    Architecture: N decoder layers (configurable via config.num_adapter_layers) + final RMSNorm.
     Uses tuple-based KV cache for compatibility with Kangaroo-style speculative decoding.
     """
 
@@ -276,9 +278,12 @@ class AdapterModel(nn.Module):
         self.padding_idx = getattr(config, 'pad_token_id', 0)
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
+        self.num_adapter_layers = getattr(config, 'num_adapter_layers', 1)
 
         self.norm = RMSNorm(config.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
-        self.layers = nn.ModuleList([AdapterDecoderLayer(config)])  # 解码层
+        self.layers = nn.ModuleList(
+            [AdapterDecoderLayer(config) for _ in range(self.num_adapter_layers)]
+        )  # N 层解码层 (TwigVLM-style stack)
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         combined_attention_mask = None
@@ -390,8 +395,13 @@ class AdapterModel(nn.Module):
         return hidden_states
 
 
-def create_adapter_config(base_model_path):
-    """Create adapter config from base model config"""
+def create_adapter_config(base_model_path, num_adapter_layers: int = 1):
+    """Create adapter config from base model config.
+
+    Args:
+        base_model_path: Path to the base Qwen2.5-VL checkpoint.
+        num_adapter_layers: Number of stacked decoder layers in the adapter.
+    """
     base_config = AutoConfig.from_pretrained(base_model_path)
     # Read mrope_section from base config's rope_scaling.
     rope_scaling = getattr(base_config, 'rope_scaling', None) or {}
@@ -411,7 +421,109 @@ def create_adapter_config(base_model_path):
     # Qwen2_5_VLConfig doesn't accept mrope_section as a kwarg; set it as
     # a custom attribute after construction so AdapterAttention can read it.
     adapter_config.mrope_section = mrope_section
+    adapter_config.num_adapter_layers = num_adapter_layers
     return adapter_config
+
+
+def init_adapter_from_base_layer(adapter_model, base_model_path, source_layer):
+    """Initialize adapter's N decoder layers from consecutive base model layers
+    starting at ``source_layer``. Also copies ``base.norm`` into ``adapter.norm``.
+    EAGLE/TwigVLM-style init that gives the adapter a strong prior.
+
+    For an adapter with N layers and source_layer S, copies:
+        base.layers[S]   -> adapter.layers[0]
+        base.layers[S+1] -> adapter.layers[1]
+        ...
+        base.layers[S+N-1] -> adapter.layers[N-1]
+        base.norm        -> adapter.norm
+
+    Returns the number of parameters successfully copied.
+    """
+    from safetensors import safe_open
+
+    num_layers = len(adapter_model.layers)
+    layer_indices = list(range(source_layer, source_layer + num_layers))
+    layer_prefixes = [f"model.layers.{idx}." for idx in layer_indices]
+    norm_key = "model.norm.weight"
+
+    def _wanted(key):
+        if key == norm_key:
+            return True
+        return any(key.startswith(p) for p in layer_prefixes)
+
+    index_path = os.path.join(base_model_path, "model.safetensors.index.json")
+    weights = {}
+    if os.path.exists(index_path):
+        with open(index_path, "r") as f:
+            weight_map = json.loads(f.read())["weight_map"]
+        files_needed = set()
+        for key, fname in weight_map.items():
+            if _wanted(key):
+                files_needed.add(fname)
+        for fname in files_needed:
+            with safe_open(os.path.join(base_model_path, fname), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if _wanted(key):
+                        weights[key] = f.get_tensor(key)
+    else:
+        single = os.path.join(base_model_path, "model.safetensors")
+        if os.path.exists(single):
+            with safe_open(single, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if _wanted(key):
+                        weights[key] = f.get_tensor(key)
+        else:
+            raise FileNotFoundError(f"No safetensors index or single file in {base_model_path}")
+
+    if not weights:
+        raise RuntimeError(
+            f"No weights found for layers {layer_indices} in {base_model_path}."
+        )
+
+    mappings = {}
+    for i, base_idx in enumerate(layer_indices):
+        layer_prefix = f"model.layers.{base_idx}."
+        adapter_prefix = f"layers.{i}."
+        mappings.update({
+            f"{layer_prefix}self_attn.q_proj.weight":         f"{adapter_prefix}self_attn.q_proj.weight",
+            f"{layer_prefix}self_attn.q_proj.bias":           f"{adapter_prefix}self_attn.q_proj.bias",
+            f"{layer_prefix}self_attn.k_proj.weight":         f"{adapter_prefix}self_attn.k_proj.weight",
+            f"{layer_prefix}self_attn.k_proj.bias":           f"{adapter_prefix}self_attn.k_proj.bias",
+            f"{layer_prefix}self_attn.v_proj.weight":         f"{adapter_prefix}self_attn.v_proj.weight",
+            f"{layer_prefix}self_attn.v_proj.bias":           f"{adapter_prefix}self_attn.v_proj.bias",
+            f"{layer_prefix}self_attn.o_proj.weight":         f"{adapter_prefix}self_attn.o_proj.weight",
+            f"{layer_prefix}input_layernorm.weight":          f"{adapter_prefix}input_layernorm.weight",
+            f"{layer_prefix}post_attention_layernorm.weight": f"{adapter_prefix}post_attention_layernorm.weight",
+            f"{layer_prefix}mlp.gate_proj.weight":            f"{adapter_prefix}gate_proj.weight",
+            f"{layer_prefix}mlp.up_proj.weight":              f"{adapter_prefix}up_proj.weight",
+            f"{layer_prefix}mlp.down_proj.weight":            f"{adapter_prefix}down_proj.weight",
+        })
+    mappings[norm_key] = "norm.weight"
+
+    adapter_state = adapter_model.state_dict()
+    new_state = {}
+    matched, skipped = 0, []
+    n_params = 0
+    for src_key, dst_key in mappings.items():
+        if src_key in weights and dst_key in adapter_state:
+            tensor = weights[src_key]
+            if tensor.shape != adapter_state[dst_key].shape:
+                skipped.append((dst_key, f"shape mismatch {tuple(tensor.shape)} vs {tuple(adapter_state[dst_key].shape)}"))
+                continue
+            new_state[dst_key] = tensor.to(adapter_state[dst_key].dtype)
+            matched += 1
+            n_params += tensor.numel()
+        else:
+            skipped.append((dst_key, f"src key '{src_key}' not in base weights" if src_key not in weights else "dst not in adapter"))
+
+    adapter_state.update(new_state)
+    adapter_model.load_state_dict(adapter_state, strict=False)
+    last_idx = layer_indices[-1] if layer_indices else source_layer
+    print(f"[init_adapter_from_base] copied {matched}/{len(mappings)} keys "
+          f"from base layers {source_layer}..{last_idx} ({n_params/1e6:.2f}M params)")
+    for dst, reason in skipped:
+        print(f"  [skip] {dst}: {reason}")
+    return matched
 
 
 if __name__ == "__main__":
