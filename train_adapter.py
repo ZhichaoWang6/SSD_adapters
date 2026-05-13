@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoConfig, get_linear_schedule_with_warmup
 
-from adapter import AdapterModel, create_adapter_config
+from adapter import AdapterModel, create_adapter_config, init_adapter_from_base_layer
 
 
 def parse_args():
@@ -26,6 +26,8 @@ def parse_args():
     parser.add_argument("--datadir", type=str, required=True, default="/data/wangzhichao/projects/SSD_RE/datasets/training_data/20_no_reply")
     parser.add_argument("--outdir", type=str, required=True, default="/data/wangzhichao/projects/SSD_full_history/adapter_checkpoints/20_no_reply")
     parser.add_argument("--exit_layer", type=int, default=4)
+    parser.add_argument("--num_adapter_layers", type=int, default=3,
+                        help="Number of stacked decoder layers in the adapter (TwigVLM-style).")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--bs", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=32)
@@ -229,84 +231,6 @@ class DataCollatorWithPadding:
         return out
 
 
-def init_adapter_from_base_layer(adapter_model, base_model_path, source_layer):
-    """Initialize adapter's single decoder layer from base.layers[source_layer].
-    Also copies base.norm into adapter.norm. EAGLE-style init.
-    Returns number of parameters successfully copied.
-    """
-    from safetensors import safe_open
-
-    layer_prefix = f"model.layers.{source_layer}."
-    norm_key = "model.norm.weight"
-
-    index_path = os.path.join(base_model_path, "model.safetensors.index.json")
-    weights = {}
-    if os.path.exists(index_path):
-        with open(index_path, "r") as f:
-            weight_map = json.loads(f.read())["weight_map"]
-        files_needed = set()
-        for key, fname in weight_map.items():
-            if key.startswith(layer_prefix) or key == norm_key:
-                files_needed.add(fname)
-        for fname in files_needed:
-            with safe_open(os.path.join(base_model_path, fname), framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if key.startswith(layer_prefix) or key == norm_key:
-                        weights[key] = f.get_tensor(key)
-    else:
-        single = os.path.join(base_model_path, "model.safetensors")
-        if os.path.exists(single):
-            with safe_open(single, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if key.startswith(layer_prefix) or key == norm_key:
-                        weights[key] = f.get_tensor(key)
-        else:
-            raise FileNotFoundError(f"No safetensors index or single file in {base_model_path}")
-
-    if not weights:
-        raise RuntimeError(f"No weights found for layer {source_layer} in {base_model_path}.")
-
-    mappings = {
-        f"{layer_prefix}self_attn.q_proj.weight":         "layers.0.self_attn.q_proj.weight",
-        f"{layer_prefix}self_attn.q_proj.bias":           "layers.0.self_attn.q_proj.bias",
-        f"{layer_prefix}self_attn.k_proj.weight":         "layers.0.self_attn.k_proj.weight",
-        f"{layer_prefix}self_attn.k_proj.bias":           "layers.0.self_attn.k_proj.bias",
-        f"{layer_prefix}self_attn.v_proj.weight":         "layers.0.self_attn.v_proj.weight",
-        f"{layer_prefix}self_attn.v_proj.bias":           "layers.0.self_attn.v_proj.bias",
-        f"{layer_prefix}self_attn.o_proj.weight":         "layers.0.self_attn.o_proj.weight",
-        f"{layer_prefix}input_layernorm.weight":          "layers.0.input_layernorm.weight",
-        f"{layer_prefix}post_attention_layernorm.weight": "layers.0.post_attention_layernorm.weight",
-        f"{layer_prefix}mlp.gate_proj.weight":            "layers.0.gate_proj.weight",
-        f"{layer_prefix}mlp.up_proj.weight":              "layers.0.up_proj.weight",
-        f"{layer_prefix}mlp.down_proj.weight":            "layers.0.down_proj.weight",
-        norm_key:                                         "norm.weight",
-    }
-
-    adapter_state = adapter_model.state_dict()
-    new_state = {}
-    matched, skipped = 0, []
-    n_params = 0
-    for src_key, dst_key in mappings.items():
-        if src_key in weights and dst_key in adapter_state:
-            tensor = weights[src_key]
-            if tensor.shape != adapter_state[dst_key].shape:
-                skipped.append((dst_key, f"shape mismatch {tuple(tensor.shape)} vs {tuple(adapter_state[dst_key].shape)}"))
-                continue
-            new_state[dst_key] = tensor.to(adapter_state[dst_key].dtype)
-            matched += 1
-            n_params += tensor.numel()
-        else:
-            skipped.append((dst_key, f"src key '{src_key}' not in base weights" if src_key not in weights else "dst not in adapter"))
-
-    adapter_state.update(new_state)
-    adapter_model.load_state_dict(adapter_state, strict=False)
-    print(f"[init_adapter_from_base] copied {matched}/{len(mappings)} keys "
-          f"from base layer {source_layer} ({n_params/1e6:.2f}M params)")
-    for dst, reason in skipped:
-        print(f"  [skip] {dst}: {reason}")
-    return matched
-
-
 def save_adapter(model, adapter_config, args, accelerator, tag):
     """Save adapter weights and config to outdir/tag/."""
     unwrapped_model = accelerator.unwrap_model(model)
@@ -319,6 +243,7 @@ def save_adapter(model, adapter_config, args, accelerator, tag):
         "num_key_value_heads": adapter_config.num_key_value_heads,
         "intermediate_size": adapter_config.intermediate_size,
         "num_hidden_layers": adapter_config.num_hidden_layers,
+        "num_adapter_layers": getattr(adapter_config, "num_adapter_layers", 1),
         "rms_norm_eps": adapter_config.rms_norm_eps,
         "vocab_size": adapter_config.vocab_size,
         "max_position_embeddings": adapter_config.max_position_embeddings,
@@ -653,16 +578,18 @@ def main():
     if accelerator.is_main_process:
         os.makedirs(args.outdir, exist_ok=True)
 
-    adapter_config = create_adapter_config(args.basepath)
+    adapter_config = create_adapter_config(args.basepath, num_adapter_layers=args.num_adapter_layers)
     adapter_config.use_mlp = not args.disable_adapter_mlp
     model = AdapterModel(adapter_config)
     if accelerator.is_main_process:
-        print(f"Adapter config: use_mlp={getattr(adapter_config, 'use_mlp', True)}")
+        print(f"Adapter config: use_mlp={getattr(adapter_config, 'use_mlp', True)}, "
+              f"num_adapter_layers={args.num_adapter_layers}")
         print(model)
 
-    if args.init_from_base_layer >= 0 and not args.resume_adapter:
+    if not args.resume_adapter:
         # All processes must initialize the same weights (called pre-DDP-prepare).
-        init_adapter_from_base_layer(model, args.basepath, args.init_from_base_layer)
+        source_layer = args.init_from_base_layer if args.init_from_base_layer >= 0 else args.exit_layer
+        init_adapter_from_base_layer(model, args.basepath, source_layer)
 
     if args.resume_adapter:
         state_dict = torch.load(args.resume_adapter, map_location="cpu")
