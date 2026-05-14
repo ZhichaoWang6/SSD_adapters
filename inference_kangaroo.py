@@ -149,9 +149,12 @@ def kangaroo_speculative_generate(
     global_tokens[:, start_index] = first_token.item()
 
     hidden_state_early = output.hidden_states[early_exit_layer]
-    _, adapter_past_key_values = adapter_model.forward_early_stop(
-        inputs_embeds=hidden_state_early,
+    # Build an empty DynamicCache; adapter writes into slots 0..N-1.
+    adapter_past_key_values = DynamicCache()
+    _, adapter_past_key_values = adapter_model(
+        hidden_states=hidden_state_early,
         position_ids=prefill_position_ids,
+        past_key_value=adapter_past_key_values,
         use_cache=True,
     )
 
@@ -192,7 +195,7 @@ def kangaroo_speculative_generate(
             in_token = global_tokens[:, end_index - 1:end_index]
             print(f"\nDraft step {step}: in_token={in_token}, in_token_decoded={tokenizer.decode(in_token[0])}, end_index: {end_index}")
 
-            adapter_cache_len = adapter_past_key_values[0][0].shape[2] if adapter_past_key_values else 0
+            adapter_cache_len = adapter_past_key_values.get_seq_length() if adapter_past_key_values is not None else 0
             if adapter_cache_len < end_index - 1:
                 hidden_state_early_last = exited_hidden_states[:, -1:, :] if exited_hidden_states is not None else None
             else:
@@ -224,7 +227,7 @@ def kangaroo_speculative_generate(
             # decode: arange over the new tokens + base_model.rope_deltas, then
             # broadcast to (3, B, L).
             adapter_seq_len = adapter_input.shape[1]
-            start_pos = adapter_past_key_values[0][0].shape[2] if adapter_past_key_values else 0
+            start_pos = adapter_past_key_values.get_seq_length() if adapter_past_key_values is not None else 0
             arange_pos = torch.arange(
                 start_pos, start_pos + adapter_seq_len,
                 device=adapter_input.device, dtype=torch.long,
@@ -234,14 +237,16 @@ def kangaroo_speculative_generate(
                 arange_pos = arange_pos + rope_deltas.to(adapter_input.device)
             adapter_position_ids = arange_pos.unsqueeze(0).expand(3, -1, -1)
 
-            hidden_state, adapter_past_key_values = adapter_model.forward_early_stop(
-                inputs_embeds=adapter_input,
+            # Adapter returns logits directly (own twig_head). No need to call
+            # head_model on the adapter's hidden state.
+            adapter_logits, adapter_past_key_values = adapter_model(
+                hidden_states=adapter_input,
                 position_ids=adapter_position_ids,
-                past_key_values=adapter_past_key_values,
+                past_key_value=adapter_past_key_values,
                 use_cache=True,
             )
 
-            predict_logits = head_model(hidden_state[:, -1:, :]).float()
+            predict_logits = adapter_logits[:, -1:, :].float()
             predicted_token = torch.argmax(predict_logits[:, -1, :], dim=-1)
 
             predict_score = predict_logits.softmax(dim=-1).max().item()
@@ -335,11 +340,16 @@ def kangaroo_speculative_generate(
         if verify_cache_len > start_index:
             base_model.trim_verify_layers_cache(start_index)
 
-        if adapter_past_key_values and adapter_past_key_values[0][0].shape[2] > start_index:
-            adapter_past_key_values = [
-                (k[:, :, :start_index, :], v[:, :, :start_index, :])
-                for k, v in adapter_past_key_values
-            ]
+        if adapter_past_key_values is not None and adapter_past_key_values.get_seq_length() > start_index:
+            # Trim DynamicCache key/value tensors in-place to keep only the
+            # first `start_index` tokens, matching the trimmed verify cache.
+            for layer_idx in range(len(adapter_past_key_values.key_cache)):
+                adapter_past_key_values.key_cache[layer_idx] = \
+                    adapter_past_key_values.key_cache[layer_idx][:, :, :start_index, :]
+                adapter_past_key_values.value_cache[layer_idx] = \
+                    adapter_past_key_values.value_cache[layer_idx][:, :, :start_index, :]
+            if hasattr(adapter_past_key_values, "_seen_tokens"):
+                adapter_past_key_values._seen_tokens = start_index
 
         base_model.past_key_values._seen_tokens = start_index
         assert base_model._get_layer_cache_length(0) == start_index, \
