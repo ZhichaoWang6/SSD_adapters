@@ -25,6 +25,49 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 
+_PRINTED_DRAFT_STRUCTURE = False
+
+
+def _print_draft_structure_once(base_model):
+    """Print the layers being used as the draft head (full base-model upper
+    layers, [early_exit_layer:]). Only prints on the first call per process.
+    """
+    global _PRINTED_DRAFT_STRUCTURE
+    if _PRINTED_DRAFT_STRUCTURE:
+        return
+    _PRINTED_DRAFT_STRUCTURE = True
+
+    qwen_model = base_model.model.model
+    early_exit_layer = base_model.early_exit_layer
+    total_layers = len(qwen_model.layers)
+    upper_layers = qwen_model.layers[early_exit_layer:]
+    upper_norm = qwen_model.norm
+    lm_head = base_model.model.lm_head
+
+    n_params = sum(p.numel() for p in upper_layers.parameters())
+    n_params += sum(p.numel() for p in upper_norm.parameters())
+
+    print("=" * 80)
+    print("[inference_kangaroo_full] DRAFT HEAD = full base-model upper layers")
+    print(f"  early_exit_layer = {early_exit_layer}")
+    print(f"  total decoder layers in base model = {total_layers}")
+    print(f"  draft uses layers [{early_exit_layer}:{total_layers}]  "
+          f"({total_layers - early_exit_layer} layers)")
+    print(f"  + final RMSNorm + lm_head (shared with verify)")
+    print(f"  draft-head trainable-equivalent params: {n_params/1e6:.2f}M "
+          "(only used during draft; verify reuses the same weights)")
+    print(f"  dtype = {next(upper_layers.parameters()).dtype}, "
+          f"device = {next(upper_layers.parameters()).device}")
+    print("-" * 80)
+    print("Draft-head module (layers[early_exit_layer:]):")
+    print(upper_layers)
+    print("-" * 80)
+    print("Final norm + lm_head:")
+    print(upper_norm)
+    print(lm_head)
+    print("=" * 80)
+
+
 def _build_stats(accept_length_list, prefill_time, draft_times, verify_times, total_time, num_new_tokens):
     decode_time = total_time - prefill_time
     avg_accept = sum(accept_length_list) / len(accept_length_list) if accept_length_list else 0
@@ -181,6 +224,8 @@ def kangaroo_speculative_generate(
     base_model = model.base_model
     head_model = model.head_model
     device = inputs['input_ids'].device
+
+    _print_draft_structure_once(base_model)
 
     tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
     token_eos = tokenizer.eos_token_id
