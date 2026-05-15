@@ -55,14 +55,29 @@ PLACEHOLDER_RE = re.compile(re.escape(IMG_PLACEHOLDER))
 
 
 def _rewrite_path(p: str, ego4d_root: str, egoexolearn_root: str) -> str:
-    """Map dataset-relative paths to absolute paths on this machine."""
-    # Common prefixes from the source jsonl.
-    if "Ego-Exo4D/frames/" in p:
-        rel = p.split("Ego-Exo4D/frames/", 1)[1]
+    """Map dataset-relative paths to absolute paths on this machine.
+
+    Matches on dataset name only and strips the immediate subdir (e.g. "frames",
+    "frames_time"), then re-roots under the user-provided absolute root. This
+    handles the common case where the jsonl was authored with one directory
+    name (e.g. "frames") but the data lives under a different name on this
+    machine (e.g. "frames_time").
+    """
+
+    def _strip_first_dir(rel: str) -> str:
+        """If rel starts with '<somedir>/...', drop '<somedir>/'. Else return as-is."""
+        return rel.split("/", 1)[1] if "/" in rel else rel
+
+    if "Ego-Exo4D/" in p:
+        after = p.split("Ego-Exo4D/", 1)[1]      # e.g. "frames/<uuid>/000001.jpg"
+        rel = _strip_first_dir(after)            # e.g. "<uuid>/000001.jpg"
         return os.path.join(ego4d_root, rel)
-    if "EgoExoLearn/frames_time/" in p:
-        rel = p.split("EgoExoLearn/frames_time/", 1)[1]
+
+    if "EgoExoLearn/" in p:
+        after = p.split("EgoExoLearn/", 1)[1]    # e.g. "frames/<uuid>/000003.jpg"
+        rel = _strip_first_dir(after)            # e.g. "<uuid>/000003.jpg"
         return os.path.join(egoexolearn_root, rel)
+
     # Anything else: treat as already-absolute or as-is.
     return p
 
