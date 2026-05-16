@@ -352,13 +352,18 @@ def compute_kl_loss(out_head, target_head, loss_mask, temperature=1.0):
 
 
 def build_prefix_weight_mask(loss_mask, prefix_tokens, prefix_start=0, decay=1.0):
-    """
-    Weight a prefix window of supervised positions for each sample.
+    """Weight a prefix window inside EACH contiguous supervised segment.
 
     loss_mask: [B, L], already shifted to mark the answer tokens being predicted.
-    prefix_start: offset into the valid supervised positions. For this speculative
-                  pipeline, 1 means "skip the free first answer token".
-    decay: geometric decay across the selected positions.
+               Every contiguous run of (>0) values is treated as one assistant
+               turn. Multi-turn ckpts (one ckpt per conversation) produce many
+               such runs; the legacy per-turn ckpts produce exactly one.
+
+    For each segment we skip `prefix_start` positions and weight the next
+    `prefix_tokens` positions with geometric `decay`. This applies the
+    speculative-decoding prefix-CE objective ("the first answer token of each
+    turn is generated for free by verify; the adapter's first real draft
+    predicts the second answer token") independently to every assistant turn.
     """
     prefix_weights = torch.zeros_like(loss_mask)
     if prefix_tokens <= 0:
@@ -366,16 +371,37 @@ def build_prefix_weight_mask(loss_mask, prefix_tokens, prefix_start=0, decay=1.0
 
     prefix_start = max(0, prefix_start)
     decay = max(0.0, float(decay))
+
     for sample_idx in range(loss_mask.shape[0]):
-        valid_positions = torch.nonzero(loss_mask[sample_idx] > 0, as_tuple=False).flatten()
-        selected = valid_positions[prefix_start:prefix_start + prefix_tokens]
-        if selected.numel() > 0:
+        row = loss_mask[sample_idx]
+        is_pos = (row > 0).to(torch.int8)
+        if int(is_pos.sum().item()) == 0:
+            continue
+
+        padded = torch.cat([
+            torch.zeros(1, dtype=torch.int8, device=is_pos.device),
+            is_pos,
+            torch.zeros(1, dtype=torch.int8, device=is_pos.device),
+        ])
+        diff = padded[1:] - padded[:-1]
+        seg_starts = torch.nonzero(diff == 1, as_tuple=False).flatten().tolist()
+        seg_ends = torch.nonzero(diff == -1, as_tuple=False).flatten().tolist()
+        # seg_ends are exclusive (one past the last position in the segment).
+
+        for seg_start, seg_end in zip(seg_starts, seg_ends):
+            seg_len = seg_end - seg_start
+            if prefix_start >= seg_len:
+                continue
+            take_start = seg_start + prefix_start
+            take_end = min(seg_end, take_start + prefix_tokens)
+            n = take_end - take_start
+            if n <= 0:
+                continue
             weights = decay ** torch.arange(
-                selected.numel(),
-                device=loss_mask.device,
-                dtype=loss_mask.dtype,
+                n, device=loss_mask.device, dtype=loss_mask.dtype,
             )
-            prefix_weights[sample_idx, selected] = weights
+            prefix_weights[sample_idx, take_start:take_end] = weights
+
     return prefix_weights
 
 
