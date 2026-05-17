@@ -18,28 +18,21 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 
-_PRINTED_POSITION_VERIFICATION = False
+_PRINTED_TEXT_POSITION_VERIFY = False
+_PRINTED_MM_POSITION_VERIFY = False
 
 
 def _verify_adapter_prefill_positions(prefill_position_ids):
-    """One-time runtime sanity check on the adapter's prefill position_ids.
-
-    Prints region structure (text_a / image / text_b) and compares against
-    what the OLD buggy 1D arange fallback would have produced. Helps confirm
-    visually that the v2 (get_rope_index) fix is actually active and that
-    the positions look correct for the input data.
-
-    Only prints on the FIRST call per process; subsequent prefills are
-    silent to avoid spamming the log.
+    """One-time-per-modality runtime sanity check on the adapter's prefill
+    position_ids. Prints once for the first pure-text input, and once
+    again for the first multimodal input where rope_deltas takes effect.
+    This way streaming-VL pipelines (text-only first turn, then frames
+    accumulate) reveal both code paths.
     """
-    global _PRINTED_POSITION_VERIFICATION
-    if _PRINTED_POSITION_VERIFICATION:
-        return
-    _PRINTED_POSITION_VERIFICATION = True
+    global _PRINTED_TEXT_POSITION_VERIFY, _PRINTED_MM_POSITION_VERIFY
 
     pos = prefill_position_ids.detach().cpu()
     if pos.dim() == 3 and pos.shape[1] == 1:
-        # (3, batch=1, seq_len) -> (3, seq_len) for easier inspection
         pos = pos[:, 0, :]
     L = pos.shape[-1]
     T_ch, H_ch, W_ch = pos[0], pos[1], pos[2]
@@ -64,6 +57,21 @@ def _verify_adapter_prefill_positions(prefill_position_ids):
             cur_start = i
     regions.append((cur_kind, cur_start, L))
 
+    n_text_a = sum(1 for k, _, _ in regions if k == 'text_a')
+    n_image = sum(1 for k, _, _ in regions if k == 'image')
+    n_text_b = sum(1 for k, _, _ in regions if k == 'text_b')
+    is_multimodal = (n_image > 0)
+
+    # Skip if we've already printed the verification for this modality.
+    if is_multimodal:
+        if _PRINTED_MM_POSITION_VERIFY:
+            return
+        _PRINTED_MM_POSITION_VERIFY = True
+    else:
+        if _PRINTED_TEXT_POSITION_VERIFY:
+            return
+        _PRINTED_TEXT_POSITION_VERIFY = True
+
     last_text_b_idx = None
     for kind, s, e in reversed(regions):
         if kind == 'text_b':
@@ -71,13 +79,7 @@ def _verify_adapter_prefill_positions(prefill_position_ids):
             break
     estimated_rope_delta = int(T_ch[last_text_b_idx] - last_text_b_idx) if last_text_b_idx is not None else 0
 
-    n_text_a = sum(1 for k, _, _ in regions if k == 'text_a')
-    n_image = sum(1 for k, _, _ in regions if k == 'image')
-    n_text_b = sum(1 for k, _, _ in regions if k == 'text_b')
-
-    # What the original buggy fallback (arange) would have produced.
     buggy = torch.arange(L)
-    # Compare per region.
     rows = []
     for kind, s, e in regions:
         proper_t = T_ch[s:e]
@@ -91,7 +93,8 @@ def _verify_adapter_prefill_positions(prefill_position_ids):
         rows.append((kind, s, e, proper_max_d))
 
     print("=" * 78)
-    print("[adapter prefill] position_id verification (one-shot, this run only)")
+    label = "MULTIMODAL" if is_multimodal else "PURE-TEXT"
+    print(f"[adapter prefill] {label} position_id verification (first {label.lower()} input)")
     print(f"  seq_len:              {L}")
     print(f"  regions detected:     {len(regions)}  "
           f"(text_a={n_text_a}, image={n_image}, text_b={n_text_b})")
@@ -108,8 +111,10 @@ def _verify_adapter_prefill_positions(prefill_position_ids):
 
     print("-" * 78)
     print("  Region summary (first 6 + last 3 shown if many):")
-    show = rows[:6] + ([("...", -1, -1, -1)] if len(rows) > 9 else []) + rows[-3:] \
-        if len(rows) > 9 else rows
+    if len(rows) > 9:
+        show = rows[:6] + [("...", -1, -1, -1)] + rows[-3:]
+    else:
+        show = rows
     for entry in show:
         kind, s, e, max_d_vs_buggy = entry
         if kind == "...":
@@ -122,9 +127,10 @@ def _verify_adapter_prefill_positions(prefill_position_ids):
             note = "(buggy is WRONG here -> fix matters)"
         print(f"    {kind:8s} [{s:5d}..{e:5d}]  len={e-s:5d}   {delta_str:35s}  {note}")
 
-    if n_image == 0 and estimated_rope_delta == 0:
+    if not is_multimodal:
         print("  >>> Pure-text input (no images / video). All three position variants")
         print("      would produce identical results. The fix has no effect here.")
+        print("      (verification will fire again the first time a multimodal input arrives)")
     else:
         bad = sum(1 for _, _, _, d in rows if d > 0)
         total = len(rows)
