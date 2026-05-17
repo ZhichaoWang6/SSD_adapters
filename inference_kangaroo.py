@@ -137,20 +137,20 @@ def kangaroo_speculative_generate(
 
     hidden_state_early = output.hidden_states[early_exit_layer]
 
-    # Build mRoPE position_ids for the adapter's prefill pass so it sees the
-    # same per-token RoPE positions as the base model did. Adapter's 1D
-    # arange fallback omits rope_deltas and is wrong for multimodal data.
-    prefill_seq_len = hidden_state_early.shape[1]
-    rope_deltas = base_model.model.rope_deltas
-    if rope_deltas is not None:
-        delta = rope_deltas.to(hidden_state_early.device)
-    else:
-        delta = 0
-    prefill_position_ids = torch.arange(
-        prefill_seq_len, device=hidden_state_early.device,
+    # Build TRUE 3D mRoPE position_ids for the adapter's prefill by reusing
+    # the base model's get_rope_index. This is the only way to get correct
+    # positions for image / video tokens (their T, H, W differ from each
+    # other and from text-style arange). The earlier "arange + rope_deltas"
+    # shortcut was wrong for text-before-image and image tokens themselves.
+    prefill_position_ids, _ = base_model.model.get_rope_index(
+        inputs['input_ids'],
+        inputs.get('image_grid_thw'),
+        inputs.get('video_grid_thw'),
+        inputs.get('second_per_grid_ts'),
+        inputs.get('attention_mask'),
     )
-    prefill_position_ids = prefill_position_ids.view(1, -1).expand(hidden_state_early.shape[0], -1) + delta
-    prefill_position_ids = prefill_position_ids.unsqueeze(0).expand(3, -1, -1)
+    prefill_position_ids = prefill_position_ids.to(hidden_state_early.device)
+    # Shape is (3, batch, seq_len) already, matching adapter's expectation.
 
     _, adapter_past_key_values = adapter_model.forward_early_stop(
         inputs_embeds=hidden_state_early,
