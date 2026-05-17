@@ -29,6 +29,7 @@ class KangarooQwenModel(nn.Module):
         adapter_model_path: str = None,
         early_exit_layer: int = 2,
         use_adapter_mlp: bool = None,
+        num_adapter_layers: int = 1,
         dtype=torch.bfloat16,
         attn_implementation: str = 'flash_attention_2',
     ):
@@ -49,8 +50,11 @@ class KangarooQwenModel(nn.Module):
             raw_model, early_exit_layer=early_exit_layer,
         )
 
-        # Create adapter
-        adapter_config = create_adapter_config(base_model_path)
+        # Create adapter (default 1 layer, override via num_adapter_layers
+        # or via the saved adapter_config.json -> num_hidden_layers).
+        adapter_config = create_adapter_config(
+            base_model_path, num_adapter_layers=num_adapter_layers,
+        )
 
         # By default, follow the structure saved with the adapter checkpoint.
         adapter_meta = {}
@@ -77,8 +81,19 @@ class KangarooQwenModel(nn.Module):
         if use_adapter_mlp is not None:
             adapter_config.use_mlp = use_adapter_mlp
 
+        # Auto-rebuild adapter with the same num_hidden_layers as the ckpt.
+        # Avoids "I passed num_adapter_layers=1 by accident but the ckpt is 3"
+        # which would silently load only the first layer's weights.
+        ckpt_num_layers = adapter_meta.get("num_hidden_layers")
+        if ckpt_num_layers is not None and ckpt_num_layers != adapter_config.num_hidden_layers:
+            print(f"[KangarooQwenModel] Overriding num_adapter_layers "
+                  f"({adapter_config.num_hidden_layers} -> {ckpt_num_layers}) "
+                  f"to match adapter checkpoint.")
+            adapter_config.num_hidden_layers = ckpt_num_layers
+
         self.adapter_model = AdapterModel(adapter_config)
-        print(f"Adapter config: use_mlp={getattr(adapter_config, 'use_mlp', True)}")
+        print(f"Adapter config: use_mlp={getattr(adapter_config, 'use_mlp', True)} "
+              f"num_hidden_layers={adapter_config.num_hidden_layers}")
         print(self.adapter_model)
 
         # Load adapter weights if provided

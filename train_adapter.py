@@ -69,7 +69,13 @@ def parse_args():
                              "model (also copies the final norm). EAGLE-style trick to inherit "
                              "long-context attention patterns from pretrained base. "
                              "-1 = disabled. Common choices: same as --exit_layer (e.g. 6), "
-                             "or num_hidden_layers - 1 (last layer).")
+                             "or num_hidden_layers - 1 (last layer). With "
+                             "--num_adapter_layers > 1, all adapter layers are initialized from "
+                             "the SAME base layer (replicated init).")
+    parser.add_argument("--num_adapter_layers", type=int, default=1,
+                        help="Number of stacked decoder layers inside the adapter "
+                             "(TwigVLM-style multi-layer adapter; default 1 matches the "
+                             "original Kangaroo single-layer setup).")
     return parser.parse_args()
 
 
@@ -266,42 +272,60 @@ def init_adapter_from_base_layer(adapter_model, base_model_path, source_layer):
     if not weights:
         raise RuntimeError(f"No weights found for layer {source_layer} in {base_model_path}.")
 
-    mappings = {
-        f"{layer_prefix}self_attn.q_proj.weight":         "layers.0.self_attn.q_proj.weight",
-        f"{layer_prefix}self_attn.q_proj.bias":           "layers.0.self_attn.q_proj.bias",
-        f"{layer_prefix}self_attn.k_proj.weight":         "layers.0.self_attn.k_proj.weight",
-        f"{layer_prefix}self_attn.k_proj.bias":           "layers.0.self_attn.k_proj.bias",
-        f"{layer_prefix}self_attn.v_proj.weight":         "layers.0.self_attn.v_proj.weight",
-        f"{layer_prefix}self_attn.v_proj.bias":           "layers.0.self_attn.v_proj.bias",
-        f"{layer_prefix}self_attn.o_proj.weight":         "layers.0.self_attn.o_proj.weight",
-        f"{layer_prefix}input_layernorm.weight":          "layers.0.input_layernorm.weight",
-        f"{layer_prefix}post_attention_layernorm.weight": "layers.0.post_attention_layernorm.weight",
-        f"{layer_prefix}mlp.gate_proj.weight":            "layers.0.gate_proj.weight",
-        f"{layer_prefix}mlp.up_proj.weight":              "layers.0.up_proj.weight",
-        f"{layer_prefix}mlp.down_proj.weight":            "layers.0.down_proj.weight",
-        norm_key:                                         "norm.weight",
-    }
+    # Per-adapter-layer key mappings. With N adapter layers we replicate the
+    # SAME base layer's weights into every adapter layer (simple but solid
+    # starting point; the layers diverge naturally during training).
+    n_adapter_layers = len(adapter_model.layers)
+    per_layer_suffixes = [
+        ("self_attn.q_proj.weight",         "self_attn.q_proj.weight"),
+        ("self_attn.q_proj.bias",           "self_attn.q_proj.bias"),
+        ("self_attn.k_proj.weight",         "self_attn.k_proj.weight"),
+        ("self_attn.k_proj.bias",           "self_attn.k_proj.bias"),
+        ("self_attn.v_proj.weight",         "self_attn.v_proj.weight"),
+        ("self_attn.v_proj.bias",           "self_attn.v_proj.bias"),
+        ("self_attn.o_proj.weight",         "self_attn.o_proj.weight"),
+        ("input_layernorm.weight",          "input_layernorm.weight"),
+        ("post_attention_layernorm.weight", "post_attention_layernorm.weight"),
+        ("mlp.gate_proj.weight",            "gate_proj.weight"),
+        ("mlp.up_proj.weight",              "up_proj.weight"),
+        ("mlp.down_proj.weight",            "down_proj.weight"),
+    ]
+    mappings = {}
+    for layer_idx in range(n_adapter_layers):
+        for src_suffix, dst_suffix in per_layer_suffixes:
+            mappings[f"{layer_prefix}{src_suffix}"] = (
+                f"layers.{layer_idx}.{dst_suffix}",
+            )
+    # Single global norm mapping (final norm shared, not per-layer).
+    mappings[norm_key] = ("norm.weight",)
 
     adapter_state = adapter_model.state_dict()
     new_state = {}
     matched, skipped = 0, []
     n_params = 0
-    for src_key, dst_key in mappings.items():
-        if src_key in weights and dst_key in adapter_state:
-            tensor = weights[src_key]
+    expected_assignments = sum(len(v) for v in mappings.values())
+    for src_key, dst_keys in mappings.items():
+        if src_key not in weights:
+            for dst_key in dst_keys:
+                skipped.append((dst_key, f"src key '{src_key}' not in base weights"))
+            continue
+        tensor = weights[src_key]
+        for dst_key in dst_keys:
+            if dst_key not in adapter_state:
+                skipped.append((dst_key, "dst not in adapter"))
+                continue
             if tensor.shape != adapter_state[dst_key].shape:
                 skipped.append((dst_key, f"shape mismatch {tuple(tensor.shape)} vs {tuple(adapter_state[dst_key].shape)}"))
                 continue
             new_state[dst_key] = tensor.to(adapter_state[dst_key].dtype)
             matched += 1
             n_params += tensor.numel()
-        else:
-            skipped.append((dst_key, f"src key '{src_key}' not in base weights" if src_key not in weights else "dst not in adapter"))
 
     adapter_state.update(new_state)
     adapter_model.load_state_dict(adapter_state, strict=False)
-    print(f"[init_adapter_from_base] copied {matched}/{len(mappings)} keys "
-          f"from base layer {source_layer} ({n_params/1e6:.2f}M params)")
+    print(f"[init_adapter_from_base] copied {matched}/{expected_assignments} weights "
+          f"from base layer {source_layer} into {n_adapter_layers} adapter layer(s) "
+          f"({n_params/1e6:.2f}M params)")
     for dst, reason in skipped:
         print(f"  [skip] {dst}: {reason}")
     return matched
@@ -653,11 +677,14 @@ def main():
     if accelerator.is_main_process:
         os.makedirs(args.outdir, exist_ok=True)
 
-    adapter_config = create_adapter_config(args.basepath)
+    adapter_config = create_adapter_config(
+        args.basepath, num_adapter_layers=args.num_adapter_layers,
+    )
     adapter_config.use_mlp = not args.disable_adapter_mlp
     model = AdapterModel(adapter_config)
     if accelerator.is_main_process:
-        print(f"Adapter config: use_mlp={getattr(adapter_config, 'use_mlp', True)}")
+        print(f"Adapter config: use_mlp={getattr(adapter_config, 'use_mlp', True)} "
+              f"num_hidden_layers={adapter_config.num_hidden_layers}")
         print(model)
 
     if args.init_from_base_layer >= 0 and not args.resume_adapter:
