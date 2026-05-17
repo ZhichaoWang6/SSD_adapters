@@ -136,8 +136,25 @@ def kangaroo_speculative_generate(
     global_tokens[:, start_index] = first_token.item()
 
     hidden_state_early = output.hidden_states[early_exit_layer]
+
+    # Build mRoPE position_ids for the adapter's prefill pass so it sees the
+    # same per-token RoPE positions as the base model did. Adapter's 1D
+    # arange fallback omits rope_deltas and is wrong for multimodal data.
+    prefill_seq_len = hidden_state_early.shape[1]
+    rope_deltas = base_model.model.rope_deltas
+    if rope_deltas is not None:
+        delta = rope_deltas.to(hidden_state_early.device)
+    else:
+        delta = 0
+    prefill_position_ids = torch.arange(
+        prefill_seq_len, device=hidden_state_early.device,
+    )
+    prefill_position_ids = prefill_position_ids.view(1, -1).expand(hidden_state_early.shape[0], -1) + delta
+    prefill_position_ids = prefill_position_ids.unsqueeze(0).expand(3, -1, -1)
+
     _, adapter_past_key_values = adapter_model.forward_early_stop(
         inputs_embeds=hidden_state_early,
+        position_ids=prefill_position_ids,
         use_cache=True,
     )
 
@@ -205,8 +222,32 @@ def kangaroo_speculative_generate(
                 print(f"Draft step {step}, token {tokenizer.decode(predicted_token)}, predict_score {predict_score} < threshold {threshold}, stopping draft")
                 break
 
+            # Build mRoPE position_ids for the adapter explicitly, matching
+            # the base model's verify-layer computation (earlyexit_qwen.py).
+            # The adapter's own fallback uses a plain 1D arange that omits
+            # rope_deltas, which is wrong for multimodal contexts (image /
+            # video tokens push the effective position forward by thousands
+            # of slots).
+            adapter_seq_len = adapter_input.shape[1]
+            adapter_past_len = (
+                adapter_past_key_values[0][0].shape[2]
+                if adapter_past_key_values is not None and len(adapter_past_key_values) > 0
+                else 0
+            )
+            rope_deltas = base_model.model.rope_deltas
+            if rope_deltas is not None:
+                delta = (adapter_past_len + rope_deltas).to(adapter_input.device)
+            else:
+                delta = adapter_past_len
+            adapter_position_ids = torch.arange(
+                adapter_seq_len, device=adapter_input.device,
+            )
+            adapter_position_ids = adapter_position_ids.view(1, -1).expand(adapter_input.shape[0], -1) + delta
+            adapter_position_ids = adapter_position_ids.unsqueeze(0).expand(3, -1, -1)
+
             hidden_state, adapter_past_key_values = adapter_model.forward_early_stop(
                 inputs_embeds=adapter_input,
+                position_ids=adapter_position_ids,
                 past_key_values=adapter_past_key_values,
                 use_cache=True,
             )
