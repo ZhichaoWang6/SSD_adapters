@@ -543,6 +543,10 @@ def main():
     base_config = AutoConfig.from_pretrained(args.basepath)
     head = nn.Linear(base_config.hidden_size, base_config.vocab_size, bias=False)
 
+    # Load lm_head in bf16 to halve its footprint (151k x 2k weight matrix is
+    # ~1.2 GB in fp32 vs ~0.6 GB in bf16) and speed up matmul. The head is
+    # frozen and only used for forward, so bf16 precision is plenty.
+    head_dtype = torch.bfloat16
     try:
         from safetensors import safe_open
 
@@ -553,7 +557,7 @@ def main():
         with safe_open(os.path.join(args.basepath, head_path), framework="pt", device="cpu") as f:
             tensor_slice = f.get_slice("lm_head.weight")
             _, hidden_dim = tensor_slice.get_shape()
-            tensor = tensor_slice[:, :hidden_dim].float()
+            tensor = tensor_slice[:, :hidden_dim].to(head_dtype)
     except Exception:
         try:
             index_path = os.path.join(args.basepath, "pytorch_model.bin.index.json")
@@ -561,17 +565,18 @@ def main():
                 index_json = json.loads(f.read())
                 head_path = index_json["weight_map"]["lm_head.weight"]
             weights = torch.load(os.path.join(args.basepath, head_path), map_location="cpu")
-            tensor = weights["lm_head.weight"].float()
+            tensor = weights["lm_head.weight"].to(head_dtype)
         except Exception:
             model_path = os.path.join(args.basepath, "model.safetensors")
             if os.path.exists(model_path):
                 from safetensors import safe_open
                 with safe_open(model_path, framework="pt", device="cpu") as f:
-                    tensor = f.get_tensor("lm_head.weight").float()
+                    tensor = f.get_tensor("lm_head.weight").to(head_dtype)
             else:
                 raise RuntimeError(f"Cannot find lm_head weights in {args.basepath}")
 
     head.weight.data = tensor
+    head.to(head_dtype)
     head.eval()
     for param in head.parameters():
         param.requires_grad = False
@@ -603,8 +608,12 @@ def main():
         batch_size=args.bs,
         shuffle=True,
         collate_fn=DataCollatorWithPadding(),
-        num_workers=0,
-        pin_memory=False,
+        # 2 workers + pin_memory is a CPU-light setup that still hides most
+        # of the per-batch IO latency behind GPU compute. Bumping num_workers
+        # higher gives diminishing returns and competes with other users on
+        # shared CPU.
+        num_workers=2,
+        pin_memory=True,
     )
     if accelerator.is_main_process:
         os.makedirs(args.outdir, exist_ok=True)
