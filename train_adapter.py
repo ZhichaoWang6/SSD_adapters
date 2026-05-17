@@ -633,7 +633,13 @@ def main():
 
     if args.resume_adapter:
         state_dict = torch.load(args.resume_adapter, map_location="cpu")
-        model.load_state_dict(state_dict)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[resume] WARNING: {len(missing)} missing keys (e.g. {missing[:3]}). "
+                  f"These will keep their freshly-initialized values from init_adapter_from_base_layer or random.")
+        if unexpected:
+            print(f"[resume] WARNING: {len(unexpected)} unexpected keys (e.g. {unexpected[:3]}). "
+                  f"These will be dropped silently.")
         print(f"Loaded pretrained adapter from {args.resume_adapter}")
         if args.init_from_base_layer >= 0:
             print(f"  (note: --init_from_base_layer was set but ignored because --resume_adapter takes precedence)")
