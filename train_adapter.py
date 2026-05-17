@@ -266,14 +266,29 @@ def compute_kl_loss(out_head, target_head, loss_mask, temperature=1.0):
     """
     out_head:    [B, L, V] adapter logits
     target_head: [B, L, V] full-model logits (teacher)
-    loss_mask:   [B, L, 1]
+    loss_mask:   [B, L, 1] (or [B, L])
+
+    Memory-efficient: gather only the masked positions BEFORE running
+    softmax/log_softmax. With sparse loss_mask (e.g. ShareGPT where only
+    ~30% of tokens are assistant content), this avoids materialising
+    [B, L, V] float32 softmax tensors over the whole sequence.
     """
     T = max(temperature, 1e-3)
-    target_p = F.softmax(target_head / T, dim=2).detach()
-    out_logp = F.log_softmax(out_head / T, dim=2)
-    per_token_kl = F.kl_div(out_logp, target_p, reduction="none").sum(dim=2) * (T ** 2)
-    mask = loss_mask.squeeze(-1)
-    return (per_token_kl * mask).sum() / mask.sum().clamp_min(1.0)
+    B, L, V = out_head.shape
+    mask = loss_mask.squeeze(-1) if loss_mask.dim() == 3 else loss_mask  # [B, L]
+    sel = mask > 0                                                         # [B, L] bool
+
+    out_flat = out_head[sel]      # [N, V]   N = number of masked positions
+    tgt_flat = target_head[sel]   # [N, V]
+    w_flat = mask[sel]            # [N]
+
+    if out_flat.shape[0] == 0:
+        return out_head.sum() * 0.0  # keep graph alive but no loss
+
+    target_p = F.softmax(tgt_flat / T, dim=-1).detach()
+    out_logp = F.log_softmax(out_flat / T, dim=-1)
+    per_token_kl = F.kl_div(out_logp, target_p, reduction="none").sum(dim=-1) * (T ** 2)
+    return (per_token_kl * w_flat).sum() / w_flat.sum().clamp_min(1.0)
 
 
 def build_prefix_weight_mask(loss_mask, prefix_tokens, prefix_start=0, decay=1.0):
@@ -338,21 +353,31 @@ def compute_prefix_argmax_ce(
     prefix_start=0,
     prefix_decay=1.0,
 ):
-    labels = target_head.argmax(dim=-1).detach()
-    B, L, V = out_head.shape
-    per_token_ce = F.cross_entropy(
-        out_head.reshape(-1, V),
-        labels.reshape(-1),
-        reduction="none",
-    ).reshape(B, L)
+    """Memory-efficient prefix CE: only compute CE at the weighted positions.
 
+    The full [B, L] CE matrix can be tens of GB for big vocabulary + long
+    sequences; instead we build the per-segment prefix-weight mask first,
+    gather just the positions where the weight > 0, and compute argmax + CE
+    only there.
+    """
     prefix_weights = build_prefix_weight_mask(
-        loss_mask.squeeze(-1),
+        loss_mask.squeeze(-1) if loss_mask.dim() == 3 else loss_mask,
         prefix_tokens,
         prefix_start=prefix_start,
         decay=prefix_decay,
-    )
-    return (per_token_ce * prefix_weights).sum() / prefix_weights.sum().clamp_min(1.0)
+    )                                                # [B, L]
+    sel = prefix_weights > 0                         # [B, L] bool
+
+    out_flat = out_head[sel]                          # [N, V]
+    if out_flat.shape[0] == 0:
+        return out_head.sum() * 0.0
+
+    tgt_flat = target_head[sel]                       # [N, V]
+    labels = tgt_flat.argmax(dim=-1).detach()         # [N]
+    w_flat = prefix_weights[sel]                      # [N]
+
+    per_token_ce = F.cross_entropy(out_flat, labels, reduction="none")  # [N]
+    return (per_token_ce * w_flat).sum() / w_flat.sum().clamp_min(1.0)
 
 
 def empty_match_stats():
