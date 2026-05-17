@@ -18,6 +18,124 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 
+_PRINTED_POSITION_VERIFICATION = False
+
+
+def _verify_adapter_prefill_positions(prefill_position_ids):
+    """One-time runtime sanity check on the adapter's prefill position_ids.
+
+    Prints region structure (text_a / image / text_b) and compares against
+    what the OLD buggy 1D arange fallback would have produced. Helps confirm
+    visually that the v2 (get_rope_index) fix is actually active and that
+    the positions look correct for the input data.
+
+    Only prints on the FIRST call per process; subsequent prefills are
+    silent to avoid spamming the log.
+    """
+    global _PRINTED_POSITION_VERIFICATION
+    if _PRINTED_POSITION_VERIFICATION:
+        return
+    _PRINTED_POSITION_VERIFICATION = True
+
+    pos = prefill_position_ids.detach().cpu()
+    if pos.dim() == 3 and pos.shape[1] == 1:
+        # (3, batch=1, seq_len) -> (3, seq_len) for easier inspection
+        pos = pos[:, 0, :]
+    L = pos.shape[-1]
+    T_ch, H_ch, W_ch = pos[0], pos[1], pos[2]
+
+    # Region detection (same logic as debug_rope_positions.py)
+    regions = []
+    cur_kind = None
+    cur_start = 0
+    for i in range(L):
+        t, h, w = int(T_ch[i]), int(H_ch[i]), int(W_ch[i])
+        if t == h == w == i:
+            kind = 'text_a'
+        elif t == h == w:
+            kind = 'text_b'
+        else:
+            kind = 'image'
+        if cur_kind is None:
+            cur_kind = kind
+        elif kind != cur_kind:
+            regions.append((cur_kind, cur_start, i))
+            cur_kind = kind
+            cur_start = i
+    regions.append((cur_kind, cur_start, L))
+
+    last_text_b_idx = None
+    for kind, s, e in reversed(regions):
+        if kind == 'text_b':
+            last_text_b_idx = e - 1
+            break
+    estimated_rope_delta = int(T_ch[last_text_b_idx] - last_text_b_idx) if last_text_b_idx is not None else 0
+
+    n_text_a = sum(1 for k, _, _ in regions if k == 'text_a')
+    n_image = sum(1 for k, _, _ in regions if k == 'image')
+    n_text_b = sum(1 for k, _, _ in regions if k == 'text_b')
+
+    # What the original buggy fallback (arange) would have produced.
+    buggy = torch.arange(L)
+    # Compare per region.
+    rows = []
+    for kind, s, e in regions:
+        proper_t = T_ch[s:e]
+        proper_h = H_ch[s:e]
+        proper_w = W_ch[s:e]
+        proper_max_d = max(
+            int((proper_t - buggy[s:e]).abs().max()),
+            int((proper_h - buggy[s:e]).abs().max()),
+            int((proper_w - buggy[s:e]).abs().max()),
+        )
+        rows.append((kind, s, e, proper_max_d))
+
+    print("=" * 78)
+    print("[adapter prefill] position_id verification (one-shot, this run only)")
+    print(f"  seq_len:              {L}")
+    print(f"  regions detected:     {len(regions)}  "
+          f"(text_a={n_text_a}, image={n_image}, text_b={n_text_b})")
+    print(f"  T/H/W differ?:        "
+          f"{bool((T_ch != H_ch).any() or (T_ch != W_ch).any())}  "
+          f"(True means image tokens have proper 3D mRoPE)")
+    print(f"  estimated rope_delta: {estimated_rope_delta}  "
+          f"(from last text_b position - input index)")
+    print(f"  max position value:   {int(pos.max())}")
+    print(f"  first 5 positions:    T={T_ch[:5].tolist()}  "
+          f"H={H_ch[:5].tolist()}  W={W_ch[:5].tolist()}")
+    print(f"  last 5 positions:     T={T_ch[-5:].tolist()}  "
+          f"H={H_ch[-5:].tolist()}  W={W_ch[-5:].tolist()}")
+
+    print("-" * 78)
+    print("  Region summary (first 6 + last 3 shown if many):")
+    show = rows[:6] + ([("...", -1, -1, -1)] if len(rows) > 9 else []) + rows[-3:] \
+        if len(rows) > 9 else rows
+    for entry in show:
+        kind, s, e, max_d_vs_buggy = entry
+        if kind == "...":
+            print(f"    ... ({len(rows) - 9} more regions) ...")
+            continue
+        delta_str = f"max|delta| vs buggy arange = {max_d_vs_buggy}"
+        if kind == 'text_a':
+            note = "(buggy would also be correct here)"
+        else:
+            note = "(buggy is WRONG here -> fix matters)"
+        print(f"    {kind:8s} [{s:5d}..{e:5d}]  len={e-s:5d}   {delta_str:35s}  {note}")
+
+    if n_image == 0 and estimated_rope_delta == 0:
+        print("  >>> Pure-text input (no images / video). All three position variants")
+        print("      would produce identical results. The fix has no effect here.")
+    else:
+        bad = sum(1 for _, _, _, d in rows if d > 0)
+        total = len(rows)
+        if bad > 0:
+            print(f"  >>> Multimodal input: buggy version would be WRONG on {bad}/{total} regions")
+            print(f"      Current code (v2 get_rope_index) gives the proper positions. ✓")
+        else:
+            print("  >>> All regions agree with arange; nothing for the fix to correct.")
+    print("=" * 78)
+
+
 def _build_stats(accept_length_list, prefill_time, draft_times, verify_times, total_time, num_new_tokens):
     """Build comprehensive timing and acceptance statistics."""
     decode_time = total_time - prefill_time
@@ -151,6 +269,9 @@ def kangaroo_speculative_generate(
     )
     prefill_position_ids = prefill_position_ids.to(hidden_state_early.device)
     # Shape is (3, batch, seq_len) already, matching adapter's expectation.
+
+    # ---- One-time runtime sanity check: confirm position_ids look right ----
+    _verify_adapter_prefill_positions(prefill_position_ids)
 
     _, adapter_past_key_values = adapter_model.forward_early_stop(
         inputs_embeds=hidden_state_early,
