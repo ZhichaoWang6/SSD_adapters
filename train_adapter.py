@@ -45,8 +45,14 @@ def parse_args():
                         help="Path to pretrained adapter_model.bin to continue training from")
     parser.add_argument("--kl_temperature", type=float, default=1.0,
                         help="Temperature for KL distribution matching. 1.0 fits the teacher distribution directly.")
+    parser.add_argument("--kl_weight", type=float, default=1.0,
+                        help="Weight for the KL distribution-matching loss. "
+                             "Set to 0 to disable KL entirely (recommended for pure-text warm-up: "
+                             "use teacher-argmax CE only via --prefix_ce_tokens 9999 --kl_weight 0).")
     parser.add_argument("--prefix_ce_tokens", type=int, default=1,
-                        help="Number of leading supervised tokens to train with teacher-argmax CE.")
+                        help="Number of leading supervised tokens to train with teacher-argmax CE. "
+                             "Set to a large number (e.g. 9999) to apply CE on ALL supervised "
+                             "positions (turns CE into a full LM-style loss).")
     parser.add_argument("--prefix_ce_weight", type=float, default=1.0,
                         help="Weight for the weighted prefix teacher-argmax CE term.")
     parser.add_argument("--prefix_ce_start", type=int, default=1,
@@ -685,12 +691,17 @@ def main():
                 prob_acc_per_token = torch.min(prob_last, prob_exit).sum(dim=2)
 
                 loss_mask = data["loss_mask"][:, :, None]
-                kl_loss = compute_kl_loss(
-                    out_head=out_head,
-                    target_head=target_head,
-                    loss_mask=loss_mask,
-                    temperature=args.kl_temperature,
-                )
+                if args.kl_weight > 0.0:
+                    kl_loss = compute_kl_loss(
+                        out_head=out_head,
+                        target_head=target_head,
+                        loss_mask=loss_mask,
+                        temperature=args.kl_temperature,
+                    )
+                else:
+                    # Skip KL entirely (faster, less GPU mem). Keep a 0-tensor
+                    # for logging so downstream prints don't break.
+                    kl_loss = out_head.sum() * 0.0
                 prefix_ce_loss = compute_prefix_argmax_ce(
                     out_head=out_head,
                     target_head=target_head,
@@ -699,7 +710,7 @@ def main():
                     prefix_start=args.prefix_ce_start,
                     prefix_decay=args.prefix_ce_decay,
                 )
-                loss = kl_loss + args.prefix_ce_weight * prefix_ce_loss
+                loss = args.kl_weight * kl_loss + args.prefix_ce_weight * prefix_ce_loss
 
                 dist_overlap = torch.sum(data["loss_mask"] * prob_acc_per_token) / data["loss_mask"].sum().clamp(min=1)
 
