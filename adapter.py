@@ -278,8 +278,7 @@ class AdapterModel(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.norm = RMSNorm(config.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
-        num_layers = int(getattr(config, 'num_hidden_layers', 1) or 1)
-        self.layers = nn.ModuleList([AdapterDecoderLayer(config) for _ in range(num_layers)])  # 解码层
+        self.layers = nn.ModuleList([AdapterDecoderLayer(config)])  # 解码层
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         combined_attention_mask = None
@@ -391,13 +390,8 @@ class AdapterModel(nn.Module):
         return hidden_states
 
 
-def create_adapter_config(base_model_path, num_adapter_layers: int = 1):
-    """Create adapter config from base model config.
-
-    num_adapter_layers: how many AdapterDecoderLayer instances to stack
-                       (TwigVLM-style multi-layer adapter; default 1
-                       matches the original Kangaroo single-layer setup).
-    """
+def create_adapter_config(base_model_path):
+    """Create adapter config from base model config"""
     base_config = AutoConfig.from_pretrained(base_model_path)
     # Read mrope_section from base config's rope_scaling.
     rope_scaling = getattr(base_config, 'rope_scaling', None) or {}
@@ -407,7 +401,6 @@ def create_adapter_config(base_model_path, num_adapter_layers: int = 1):
         num_attention_heads=base_config.num_attention_heads,
         num_key_value_heads=base_config.num_key_value_heads,
         intermediate_size=base_config.intermediate_size,
-        num_hidden_layers=int(num_adapter_layers),
         rms_norm_eps=base_config.rms_norm_eps,
         vocab_size=base_config.vocab_size,
         max_position_embeddings=base_config.max_position_embeddings,
