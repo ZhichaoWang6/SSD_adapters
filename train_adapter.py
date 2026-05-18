@@ -78,6 +78,15 @@ def parse_args():
                              "long-context attention patterns from pretrained base. "
                              "-1 = disabled. Common choices: same as --exit_layer (e.g. 6), "
                              "or num_hidden_layers - 1 (last layer).")
+    parser.add_argument("--val_ratio", type=float, default=0.05,
+                        help="Fraction of data held out for validation (default 0.05 = 5%%). "
+                             "Set to 0 to disable validation and train on all data (legacy mode).")
+    parser.add_argument("--val_seed", type=int, default=42,
+                        help="Seed for the deterministic train/val split. Same value + same "
+                             "data list reproduces the same split across runs.")
+    parser.add_argument("--val_subsample", type=int, default=0,
+                        help="If > 0, evaluate at most this many val samples per epoch "
+                             "(random subset). Useful when full val is slow. 0 = use all val.")
     return parser.parse_args()
 
 
@@ -504,6 +513,81 @@ def compute_match_stats(
     return stats
 
 
+@torch.no_grad()
+def evaluate_on_loader(model, head, val_loader, accelerator, args):
+    """One epoch of forward-only evaluation on the held-out set. Mirrors the
+    training-loop metric collection so train and val numbers are directly
+    comparable. No gradients, model put back into train mode on exit.
+    """
+    if val_loader is None:
+        return None
+    model.eval()
+    total_loss = 0.0
+    total_dist_overlap = 0.0
+    n_batches = 0
+    match_totals = empty_match_stats()
+
+    for data in tqdm(val_loader, desc="[val]", leave=False):
+        predict = model(
+            inputs_embeds=data["hidden_states_early"],
+            attention_mask=data["attention_mask"],
+            position_ids=data.get("position_ids"),
+        )
+        target_head = head(data["target"].float())
+        out_head = head(predict.float())
+        prob_exit = F.softmax(out_head, dim=2)
+        prob_target = F.softmax(target_head, dim=2)
+        prob_acc_per_token = torch.min(prob_target, prob_exit).sum(dim=2)
+
+        loss_mask = data["loss_mask"][:, :, None]
+        if args.kl_weight > 0.0:
+            kl_loss = compute_kl_loss(
+                out_head=out_head, target_head=target_head,
+                loss_mask=loss_mask, temperature=args.kl_temperature,
+            )
+        else:
+            kl_loss = out_head.sum() * 0.0
+        prefix_ce_loss = compute_prefix_argmax_ce(
+            out_head=out_head, target_head=target_head, loss_mask=loss_mask,
+            prefix_tokens=args.prefix_ce_tokens,
+            prefix_start=args.prefix_ce_start,
+            prefix_decay=args.prefix_ce_decay,
+        )
+        loss = args.kl_weight * kl_loss + args.prefix_ce_weight * prefix_ce_loss
+        dist_overlap = (data["loss_mask"] * prob_acc_per_token).sum() / data["loss_mask"].sum().clamp(min=1)
+
+        batch_stats = compute_match_stats(
+            out_head=out_head, target_head=target_head,
+            loss_mask=data["loss_mask"],
+            prob_exit=prob_exit, prob_target=prob_target,
+            draft_start=1,
+            draft_prefix_tokens=max(args.prefix_ce_tokens, 1),
+        )
+        add_match_stats(match_totals, batch_stats)
+        total_loss += loss.item()
+        total_dist_overlap += dist_overlap.item()
+        n_batches += 1
+
+    global_match = gather_match_stats(accelerator, match_totals)
+    metrics = {
+        'loss':         total_loss / max(n_batches, 1),
+        'dist_overlap': total_dist_overlap / max(n_batches, 1),
+        'top1':         match_acc(global_match, 'token'),
+        'first':        match_acc(global_match, 'first'),
+        'draft1':       match_acc(global_match, 'draft1'),
+        'draftK':       match_acc(global_match, 'draft_prefix'),
+        'long_top1':    match_acc(global_match, 'long_token'),
+        'long_draft1':  match_acc(global_match, 'long_draft1'),
+        'long_draftK':  match_acc(global_match, 'long_draft_prefix'),
+        'dconf':        match_conf(global_match, 'draft1', 'adapter'),
+        'tconf':        match_conf(global_match, 'draft1', 'teacher'),
+        'long_dconf':   match_conf(global_match, 'long_draft1', 'adapter'),
+        'n_batches':    n_batches,
+    }
+    model.train()
+    return metrics
+
+
 def compute_confidence_stats(prob_exit, loss_mask):
     max_conf_per_token = prob_exit.max(dim=2).values
     total_confidence = (max_conf_per_token * loss_mask).sum().item()
@@ -599,9 +683,30 @@ def main():
             f"min_context_len={args.min_context_len}, max_context_len={args.max_context_len})"
         )
 
-    print(f"Training: {len(datapath)} samples")
+    # Deterministic train/val split. Same args.val_seed + same datapath list
+    # produces the same split across runs, so resuming sees the same val set.
+    import random as _random
+    _shuffled = sorted(datapath)
+    _rng = _random.Random(args.val_seed)
+    _rng.shuffle(_shuffled)
+    if args.val_ratio > 0:
+        n_val = max(1, int(len(_shuffled) * args.val_ratio))
+        val_paths = _shuffled[:n_val]
+        train_paths = _shuffled[n_val:]
+        # Optional cap on val set size for fast per-epoch eval.
+        if args.val_subsample > 0 and len(val_paths) > args.val_subsample:
+            val_paths = val_paths[:args.val_subsample]
+    else:
+        val_paths = []
+        train_paths = _shuffled
 
-    traindataset = AdapterDataset(datapath, args.exit_layer)
+    if accelerator.is_main_process:
+        print(f"Train: {len(train_paths)} samples")
+        print(f"Val:   {len(val_paths)} samples"
+              f" (val_ratio={args.val_ratio}, seed={args.val_seed}"
+              f"{', subsample=' + str(args.val_subsample) if args.val_subsample else ''})")
+
+    traindataset = AdapterDataset(train_paths, args.exit_layer)
 
     train_loader = DataLoader(
         traindataset,
@@ -615,6 +720,20 @@ def main():
         num_workers=2,
         pin_memory=True,
     )
+
+    if val_paths:
+        valdataset = AdapterDataset(val_paths, args.exit_layer)
+        val_loader = DataLoader(
+            valdataset,
+            batch_size=args.bs,
+            shuffle=False,
+            collate_fn=DataCollatorWithPadding(),
+            num_workers=2,
+            pin_memory=True,
+        )
+    else:
+        val_loader = None
+
     if accelerator.is_main_process:
         os.makedirs(args.outdir, exist_ok=True)
 
@@ -648,6 +767,8 @@ def main():
     model, head, optimizer, train_loader = accelerator.prepare(
         model, head, optimizer, train_loader
     )
+    if val_loader is not None:
+        val_loader = accelerator.prepare(val_loader)
 
     updates_per_epoch = max(1, (len(train_loader) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps)
     total_training_steps = args.total_steps if args.total_steps > 0 else updates_per_epoch * args.num_epochs
@@ -819,9 +940,12 @@ def main():
         epoch_draft1_teacher_confidence = match_conf(global_match_stats, "draft1", "teacher")
         epoch_long_draft1_confidence = match_conf(global_match_stats, "long_draft1", "adapter")
 
+        # ---- Validation pass (no gradients) ----
+        val_metrics = evaluate_on_loader(model, head, val_loader, accelerator, args)
+
         if accelerator.is_main_process:
             print(
-                f"Epoch [{epoch + 1}/{args.num_epochs}]"
+                f"Train [{epoch + 1}/{args.num_epochs}]"
                 f"  Loss: {epoch_loss:.4f}"
                 f"  Top1: {100 * epoch_acc:.2f}%"
                 f"  First(free): {100 * epoch_first_acc:.2f}%"
@@ -835,34 +959,79 @@ def main():
                 f"  LongDConf: {epoch_long_draft1_confidence:.4f}"
                 f"  DistOverlap: {epoch_dist_overlap:.4f}"
             )
+            if val_metrics is not None:
+                print(
+                    f"Val   [{epoch + 1}/{args.num_epochs}]"
+                    f"  Loss: {val_metrics['loss']:.4f}"
+                    f"  Top1: {100 * val_metrics['top1']:.2f}%"
+                    f"  First(free): {100 * val_metrics['first']:.2f}%"
+                    f"  Draft1: {100 * val_metrics['draft1']:.2f}%"
+                    f"  DraftK: {100 * val_metrics['draftK']:.2f}%"
+                    f"  LongTop1: {100 * val_metrics['long_top1']:.2f}%"
+                    f"  LongDraft1: {100 * val_metrics['long_draft1']:.2f}%"
+                    f"  LongDraftK: {100 * val_metrics['long_draftK']:.2f}%"
+                    f"  DConf: {val_metrics['dconf']:.4f}"
+                    f"  TConf: {val_metrics['tconf']:.4f}"
+                    f"  LongDConf: {val_metrics['long_dconf']:.4f}"
+                    f"  DistOverlap: {val_metrics['dist_overlap']:.4f}"
+                )
             if nan_detected:
                 print("  Some NaN batches were skipped")
+
+            # Use VAL metrics for ckpt name if we have a val set, train metrics otherwise.
+            if val_metrics is not None:
+                tag_prefix = "val"
+                tag_top1 = val_metrics['top1']
+                tag_draft1 = val_metrics['draft1']
+                tag_long_draft1 = val_metrics['long_draft1']
+                tag_overlap = val_metrics['dist_overlap']
+                tag_loss = val_metrics['loss']
+            else:
+                tag_prefix = "train"
+                tag_top1 = epoch_acc
+                tag_draft1 = epoch_draft1_acc
+                tag_long_draft1 = epoch_long_draft1_acc
+                tag_overlap = epoch_dist_overlap
+                tag_loss = epoch_loss
 
             epoch_tag = (
                 f"epochs/"
                 f"epoch{epoch:03d}"
-                f"_top1{epoch_acc:.4f}"
-                f"_draft1{epoch_draft1_acc:.4f}"
-                f"_longdraft1{epoch_long_draft1_acc:.4f}"
-                f"_overlap{epoch_dist_overlap:.4f}"
-                f"_loss{epoch_loss:.4f}"
+                f"_{tag_prefix}top1{tag_top1:.4f}"
+                f"_{tag_prefix}draft1{tag_draft1:.4f}"
+                f"_{tag_prefix}longdraft1{tag_long_draft1:.4f}"
+                f"_{tag_prefix}overlap{tag_overlap:.4f}"
+                f"_{tag_prefix}loss{tag_loss:.4f}"
             )
             save_adapter(model, adapter_config, args, accelerator, epoch_tag)
 
             if writer is not None:
-                writer.add_scalar("epoch/loss", epoch_loss, epoch)
-                writer.add_scalar("epoch/top1_acc", epoch_acc, epoch)
-                writer.add_scalar("epoch/free_first_acc", epoch_first_acc, epoch)
-                writer.add_scalar("epoch/draft1_acc", epoch_draft1_acc, epoch)
-                writer.add_scalar("epoch/draft_prefix_acc", epoch_draft_prefix_acc, epoch)
-                writer.add_scalar("epoch/long_top1_acc", epoch_long_acc, epoch)
-                writer.add_scalar("epoch/long_draft1_acc", epoch_long_draft1_acc, epoch)
-                writer.add_scalar("epoch/long_draft_prefix_acc", epoch_long_draft_prefix_acc, epoch)
-                writer.add_scalar("epoch/dist_overlap", epoch_dist_overlap, epoch)
-                writer.add_scalar("epoch/confidence", epoch_confidence, epoch)
-                writer.add_scalar("epoch/draft1_adapter_confidence", epoch_draft1_confidence, epoch)
-                writer.add_scalar("epoch/draft1_teacher_confidence", epoch_draft1_teacher_confidence, epoch)
-                writer.add_scalar("epoch/long_draft1_adapter_confidence", epoch_long_draft1_confidence, epoch)
+                writer.add_scalar("train/loss", epoch_loss, epoch)
+                writer.add_scalar("train/top1_acc", epoch_acc, epoch)
+                writer.add_scalar("train/free_first_acc", epoch_first_acc, epoch)
+                writer.add_scalar("train/draft1_acc", epoch_draft1_acc, epoch)
+                writer.add_scalar("train/draft_prefix_acc", epoch_draft_prefix_acc, epoch)
+                writer.add_scalar("train/long_top1_acc", epoch_long_acc, epoch)
+                writer.add_scalar("train/long_draft1_acc", epoch_long_draft1_acc, epoch)
+                writer.add_scalar("train/long_draft_prefix_acc", epoch_long_draft_prefix_acc, epoch)
+                writer.add_scalar("train/dist_overlap", epoch_dist_overlap, epoch)
+                writer.add_scalar("train/confidence", epoch_confidence, epoch)
+                writer.add_scalar("train/draft1_adapter_confidence", epoch_draft1_confidence, epoch)
+                writer.add_scalar("train/draft1_teacher_confidence", epoch_draft1_teacher_confidence, epoch)
+                writer.add_scalar("train/long_draft1_adapter_confidence", epoch_long_draft1_confidence, epoch)
+                if val_metrics is not None:
+                    writer.add_scalar("val/loss", val_metrics['loss'], epoch)
+                    writer.add_scalar("val/top1_acc", val_metrics['top1'], epoch)
+                    writer.add_scalar("val/free_first_acc", val_metrics['first'], epoch)
+                    writer.add_scalar("val/draft1_acc", val_metrics['draft1'], epoch)
+                    writer.add_scalar("val/draft_prefix_acc", val_metrics['draftK'], epoch)
+                    writer.add_scalar("val/long_top1_acc", val_metrics['long_top1'], epoch)
+                    writer.add_scalar("val/long_draft1_acc", val_metrics['long_draft1'], epoch)
+                    writer.add_scalar("val/long_draft_prefix_acc", val_metrics['long_draftK'], epoch)
+                    writer.add_scalar("val/dist_overlap", val_metrics['dist_overlap'], epoch)
+                    writer.add_scalar("val/draft1_adapter_confidence", val_metrics['dconf'], epoch)
+                    writer.add_scalar("val/draft1_teacher_confidence", val_metrics['tconf'], epoch)
+                    writer.add_scalar("val/long_draft1_adapter_confidence", val_metrics['long_dconf'], epoch)
 
         if epoch % args.save_freq == 0 or epoch == args.start_epoch + args.num_epochs - 1:
             accelerator.save_state(output_dir=os.path.join(args.outdir, "state", f"state_{epoch}"))
