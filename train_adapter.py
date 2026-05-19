@@ -427,14 +427,15 @@ def main():
                     pos = torch.arange(L, device=input_ids.device).view(1, -1).expand(B, -1)
                     position_ids = pos.unsqueeze(0).expand(3, -1, -1).contiguous()
 
-                # Pass the 2D padding mask straight to the adapter. The inner
-                # Qwen FlashAttention2 reads this and constructs cu_seqlens for
-                # the varlen path internally. A 4D additive mask would crash
-                # flash-attn.
+                # Pass None to take the pure-causal flash_attn_func path.
+                # Right-padding + causal means real tokens never attend to
+                # padding, and padding positions are masked out of the loss by
+                # loss_mask. Avoids a flash-attn varlen cu_seqlens shape quirk
+                # triggered when a 2D mask is passed.
                 logits, _ = model(
                     hidden_states=hidden_states_early,
                     position_ids=position_ids,
-                    attention_mask=attention_mask_1d,
+                    attention_mask=None,
                     past_key_value=None,
                     use_cache=False,
                 )

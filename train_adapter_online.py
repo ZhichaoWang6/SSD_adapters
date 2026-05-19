@@ -396,13 +396,16 @@ def main():
                     # index K = output of last remaining layer = input to (deleted) layer K.
                     hidden_states_early = base_out.hidden_states[args.exit_layer]
 
-                # Pass the 2D padding mask straight through; Qwen FlashAttention2
-                # handles causal + cu_seqlens for variable-length sequences from
-                # this. Building a 4D additive mask here crashes flash-attn.
+                # bs=1 → there is no inter-sample padding (a single processed
+                # sample has no zero-attention positions). Pass None to make the
+                # Qwen FlashAttention2 layer take the pure-causal flash_attn_func
+                # path instead of flash_attn_varlen_func; the latter sometimes
+                # mis-shapes cu_seqlens depending on the
+                # transformers / flash-attn version combo.
                 logits, _ = adapter(
                     hidden_states=hidden_states_early,
                     position_ids=position_ids,
-                    attention_mask=data["attention_mask"],
+                    attention_mask=None,
                     use_cache=False,
                 )
                 loss = compute_ce_loss(logits, data["input_ids"], data["loss_mask"])
