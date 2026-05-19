@@ -644,6 +644,46 @@ def load_examples(path):
         return json.load(f)
 
 
+def normalize_example(example, default_system_prompt, example_idx=0):
+    """Return a dict guaranteed to have 'question_id' and 'conversation' fields.
+
+    Accepted input formats (the first key found wins):
+      - {'conversation': [{role, content}, ...]}   already proper
+      - {'messages':     [{role, content}, ...]}   SFT format
+      - {'turns':        [str, str, ...]}           MT-Bench format
+                                                    (each str becomes a user msg)
+    A question_id is auto-generated when missing.
+    A leading system message is added when missing.
+    """
+    if 'conversation' in example:
+        conv = list(example['conversation'])
+    elif 'messages' in example:
+        conv = list(example['messages'])
+    elif 'turns' in example:
+        # MT-Bench style: list of user-turn strings.
+        conv = [{'role': 'user', 'content': str(t)} for t in example['turns']]
+    else:
+        raise KeyError(
+            f"example has no 'conversation' / 'messages' / 'turns' field. "
+            f"Keys found: {sorted(example.keys())}"
+        )
+
+    if not conv or conv[0].get('role') != 'system':
+        conv = [{'role': 'system', 'content': default_system_prompt}] + conv
+
+    qid = (
+        example.get('question_id')
+        or (example.get('metadata') or {}).get('question_id')
+        or example.get('id')
+        or f'item_{example_idx}'
+    )
+
+    return {
+        'question_id': str(qid),
+        'conversation': conv,
+    }
+
+
 def main():
     all_stats = []
     args = parse_args()
@@ -665,6 +705,10 @@ def main():
     wrapper.set_fps(frame_interval=frame_interval)
 
     for example_i, example in enumerate(tqdm(data_list)):
+        # Normalize input format: accepts 'conversation' / 'messages' / 'turns'
+        # so the same script works on multimodal streaming data AND on
+        # text-only benchmarks like MT-Bench or ShareGPT.
+        example = normalize_example(example, args.system_prompt, example_idx=example_i)
         if example['question_id'] in existing_question_ids:
             print(f"question {example['question_id']} already exists in {args.output_fname}, skip")
             continue
