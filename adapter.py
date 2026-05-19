@@ -30,25 +30,6 @@ import torch.nn as nn
 from transformers.cache_utils import DynamicCache
 
 
-def _build_causal_4d_mask(
-    seq_len: int,
-    past_len: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build a (1, 1, Q, K) additive causal mask compatible with HF attention layers."""
-    total_len = seq_len + past_len
-    q_pos = torch.arange(seq_len, device=device).view(-1, 1) + past_len
-    k_pos = torch.arange(total_len, device=device).view(1, -1)
-    neg_inf = torch.finfo(dtype).min
-    mask = torch.where(
-        k_pos <= q_pos,
-        torch.zeros((), dtype=dtype, device=device),
-        torch.full((), neg_inf, dtype=dtype, device=device),
-    )
-    return mask[None, None, :, :]
-
-
 class AdapterModel(nn.Module):
     """TwigVLM-style adapter built on top of Qwen2.5-VL native decoder layers."""
 
@@ -110,9 +91,10 @@ class AdapterModel(nn.Module):
                 input expected by base.layers[exit_layer].
             position_ids: (3, B, L) mRoPE 3D positions OR (B, L) which will be
                 broadcast to 3 channels.
-            attention_mask: 4D additive mask `(B|1, 1, L, L+past_len)`. If None,
-                a fresh causal mask is built (suitable for training and for
-                inference when no padding is needed).
+            attention_mask: 2D padding mask (B, L) with 1 on real tokens and 0
+                on padding, OR None for "no padding, pure causal". The inner
+                Qwen FlashAttention2 expects this shape (or None) — passing a
+                4D mask would crash flash-attn's varlen path.
             past_key_value: DynamicCache or None.
             cache_position: (L,) absolute positions for KV cache write slots.
             use_cache: whether to return updated cache.
@@ -123,15 +105,11 @@ class AdapterModel(nn.Module):
         """
         B, L, _ = hidden_states.shape
         device = hidden_states.device
-        dtype = hidden_states.dtype
 
         past_len = past_key_value.get_seq_length() if past_key_value is not None else 0
 
         if cache_position is None:
             cache_position = torch.arange(past_len, past_len + L, device=device)
-
-        if attention_mask is None and L > 1:
-            attention_mask = _build_causal_4d_mask(L, past_len, dtype, device)
 
         # Normalize position_ids to (3, B, L). Native mRoPE expects 3 channels.
         if position_ids.dim() == 2:

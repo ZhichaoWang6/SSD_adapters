@@ -247,26 +247,6 @@ def save_adapter(model, args, accelerator, tag):
     print(f"  Saved [{tag}] to {save_dir}")
 
 
-def _build_train_attention_mask(attention_mask_1d, dtype, device):
-    """Combine causal mask + 1D padding mask into a 4D additive mask."""
-    B, L = attention_mask_1d.shape
-    neg_inf = torch.finfo(dtype).min
-    q = torch.arange(L, device=device).view(-1, 1)
-    k = torch.arange(L, device=device).view(1, -1)
-    causal = torch.where(
-        k <= q,
-        torch.zeros((), dtype=dtype, device=device),
-        torch.full((), neg_inf, dtype=dtype, device=device),
-    )[None, None, :, :]
-    pad = (attention_mask_1d == 0).to(device=device)
-    pad_mask = torch.where(
-        pad,
-        torch.full((), neg_inf, dtype=dtype, device=device),
-        torch.zeros((), dtype=dtype, device=device),
-    )[:, None, None, :]
-    return causal + pad_mask
-
-
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -416,16 +396,13 @@ def main():
                     # index K = output of last remaining layer = input to (deleted) layer K.
                     hidden_states_early = base_out.hidden_states[args.exit_layer]
 
-                attn_4d = _build_train_attention_mask(
-                    data["attention_mask"],
-                    hidden_states_early.dtype,
-                    hidden_states_early.device,
-                )
-
+                # Pass the 2D padding mask straight through; Qwen FlashAttention2
+                # handles causal + cu_seqlens for variable-length sequences from
+                # this. Building a 4D additive mask here crashes flash-attn.
                 logits, _ = adapter(
                     hidden_states=hidden_states_early,
                     position_ids=position_ids,
-                    attention_mask=attn_4d,
+                    attention_mask=data["attention_mask"],
                     use_cache=False,
                 )
                 loss = compute_ce_loss(logits, data["input_ids"], data["loss_mask"])

@@ -427,16 +427,14 @@ def main():
                     pos = torch.arange(L, device=input_ids.device).view(1, -1).expand(B, -1)
                     position_ids = pos.unsqueeze(0).expand(3, -1, -1).contiguous()
 
-                # Build a 4D additive mask combining causal + padding from attention_mask_1d.
-                # For training, sequences within a batch are right-padded with 0 in attention_mask_1d.
-                attention_mask_4d = _build_train_attention_mask(
-                    attention_mask_1d, hidden_states_early.dtype, hidden_states_early.device,
-                )
-
+                # Pass the 2D padding mask straight to the adapter. The inner
+                # Qwen FlashAttention2 reads this and constructs cu_seqlens for
+                # the varlen path internally. A 4D additive mask would crash
+                # flash-attn.
                 logits, _ = model(
                     hidden_states=hidden_states_early,
                     position_ids=position_ids,
-                    attention_mask=attention_mask_4d,
+                    attention_mask=attention_mask_1d,
                     past_key_value=None,
                     use_cache=False,
                 )
@@ -490,35 +488,6 @@ def main():
             state_dir = os.path.join(args.outdir, "state", f"state_{epoch}")
             os.makedirs(state_dir, exist_ok=True)
             accelerator.save_state(state_dir)
-
-
-def _build_train_attention_mask(attention_mask_1d, dtype, device):
-    """Combine causal mask + 1D padding mask into a 4D additive mask.
-
-    attention_mask_1d: (B, L) with 1 on real tokens, 0 on padding.
-    Returns: (B, 1, L, L) additive mask.
-    """
-    B, L = attention_mask_1d.shape
-    neg_inf = torch.finfo(dtype).min
-
-    # Causal (1, 1, L, L)
-    q = torch.arange(L, device=device).view(-1, 1)
-    k = torch.arange(L, device=device).view(1, -1)
-    causal = torch.where(
-        k <= q,
-        torch.zeros((), dtype=dtype, device=device),
-        torch.full((), neg_inf, dtype=dtype, device=device),
-    )[None, None, :, :]
-
-    # Padding: mask out columns where attention_mask_1d == 0 → (B, 1, 1, L)
-    pad = (attention_mask_1d == 0).to(device=device)
-    pad_mask = torch.where(
-        pad,
-        torch.full((), neg_inf, dtype=dtype, device=device),
-        torch.zeros((), dtype=dtype, device=device),
-    )[:, None, None, :]
-
-    return causal + pad_mask
 
 
 if __name__ == "__main__":
