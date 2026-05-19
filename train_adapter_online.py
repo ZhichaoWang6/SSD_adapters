@@ -271,6 +271,14 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    if args.bs != 1:
+        raise ValueError(
+            f"--bs={args.bs} is not supported. Multimodal batching (variable-length "
+            f"pixel_values / image_grid_thw) is not implemented in this script. "
+            f"Use --bs 1 and raise --gradient_accumulation_steps to grow the effective "
+            f"batch size (current effective batch = {args.gradient_accumulation_steps})."
+        )
+
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -386,19 +394,24 @@ def main():
                         second_per_grid_ts=data.get("second_per_grid_ts"),
                         attention_mask=data.get("attention_mask"),
                     )
-                    base_out = base_model.model(
+                    # Inner Qwen2_5_VLModel.forward does NOT accept
+                    # second_per_grid_ts (only the outer ForCG class does).
+                    # The temporal info already lives inside position_ids that
+                    # we computed above, so we just don't pass it here.
+                    base_kwargs = dict(
                         input_ids=data["input_ids"],
                         attention_mask=data.get("attention_mask"),
                         position_ids=position_ids,
-                        pixel_values=data.get("pixel_values"),
-                        pixel_values_videos=data.get("pixel_values_videos"),
-                        image_grid_thw=data.get("image_grid_thw"),
-                        video_grid_thw=data.get("video_grid_thw"),
-                        second_per_grid_ts=data.get("second_per_grid_ts"),
                         output_hidden_states=True,
                         return_dict=True,
                         use_cache=False,
                     )
+                    for k in ("pixel_values", "pixel_values_videos",
+                              "image_grid_thw", "video_grid_thw"):
+                        v = data.get(k)
+                        if v is not None:
+                            base_kwargs[k] = v
+                    base_out = base_model.model(**base_kwargs)
                     # After del layers[K:], all_hidden_states has K+1 entries;
                     # index K = output of last remaining layer = input to (deleted) layer K.
                     hidden_states_early = base_out.hidden_states[args.exit_layer]
