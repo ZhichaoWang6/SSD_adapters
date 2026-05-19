@@ -46,6 +46,10 @@ def parse_args():
     parser.add_argument("--compare_AR_SSD", action="store_true")
     parser.add_argument("--adapter_path", type=str, default="/data/wangzhichao/projects/SSD_full_history/adapter_checkpoints/10_no_reply/epochs/epoch025_acc0.9144_accept0.9070_loss0.8976")
     parser.add_argument("--exit_layer", type=int, default=2)
+    parser.add_argument("--num_adapter_layers", type=int, default=1,
+                        help="Number of stacked transformer layers in the adapter. "
+                             "Must match the saved adapter checkpoint (kangaroo_model.py "
+                             "also auto-detects from adapter_config.json and will override).")
     parser.add_argument("--disable_adapter_mlp", action="store_true")
     parser.add_argument("--speculative_threshold", type=float, default=0.6)
     parser.add_argument("--speculative_steps", type=int, default=6)
@@ -97,6 +101,7 @@ class ProactiveInferenceClient:
                 adapter_model_path=args.adapter_path,
                 early_exit_layer=args.exit_layer,
                 use_adapter_mlp=None if not args.disable_adapter_mlp else False,
+                num_adapter_layers=args.num_adapter_layers,
                 dtype=torch.bfloat16,
                 attn_implementation=args.attn_implementation,
             ).to(args.device)
